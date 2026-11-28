@@ -4522,6 +4522,59 @@ func TestDBOpen_CorruptedCheckpoint(t *testing.T) {
 		seriesSet := query(t, q, labels.MustNewMatcher(labels.MatchEqual, "__name__", "checkpoint_series"))
 		require.NotEmpty(t, seriesSet[`{__name__="checkpoint_series", instance="a"}`])
 	})
+
+	t.Run("snapshot deletion failure does not resurrect reset head", func(t *testing.T) {
+		dir, cpDir, _ := setupDir(t)
+
+		cpSeg := wlog.SegmentName(cpDir, 0)
+		f, err := os.OpenFile(cpSeg, os.O_RDWR, 0o666)
+		require.NoError(t, err)
+		r := wlog.NewReader(bufio.NewReader(f))
+		require.True(t, r.Next())
+		_, err = f.WriteAt([]byte{99}, r.Offset())
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		snapshotDir, _, _, err := LastChunkSnapshot(dir)
+		require.NoError(t, err)
+		require.NoError(t, os.Chmod(snapshotDir, 0o555))
+		t.Cleanup(func() { _ = os.Chmod(snapshotDir, 0o755) })
+
+		// A read-only directory does not stop deletion for root or on Windows,
+		// so skip when the permission change does not take effect.
+		probe := filepath.Join(snapshotDir, "probe")
+		if pf, err := os.Create(probe); err == nil {
+			require.NoError(t, pf.Close())
+			require.NoError(t, os.Remove(probe))
+			t.Skip("read-only snapshot directory is still writable on this platform")
+		}
+
+		opts := DefaultOptions()
+		opts.WALSegmentSize = walSegmentSize
+		opts.OutOfOrderTimeWindow = oooWindow
+		opts.MinBlockDuration = 10000
+		opts.MaxBlockDuration = 10000
+		opts.EnableMemorySnapshotOnShutdown = true
+
+		db, err := Open(dir, nil, nil, opts, nil)
+		require.Nil(t, db)
+		require.ErrorContains(t, err, "delete chunk snapshots")
+		// The corrupted checkpoint must survive the failed reset so the next
+		// Open detects the corruption again and finishes the reset.
+		_, err = os.Stat(cpDir)
+		require.NoError(t, err)
+
+		require.NoError(t, os.Chmod(snapshotDir, 0o755))
+		db, err = Open(dir, nil, nil, opts, nil)
+		require.NoError(t, err)
+		defer func() { require.NoError(t, db.Close()) }()
+
+		q, err := db.Querier(3490, 3490)
+		require.NoError(t, err)
+		got := query(t, q,
+			labels.MustNewMatcher(labels.MatchEqual, "__name__", "checkpoint_series"))
+		require.Empty(t, got)
+	})
 }
 
 // TestCompactSelectedSeries_LateAppendDuringCompactionSurvivesRestart

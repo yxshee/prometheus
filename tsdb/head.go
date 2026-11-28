@@ -1141,18 +1141,16 @@ func (h *Head) Init(minValidTime int64) error {
 // reset clears all on-disk and in-memory head state (WAL, WBL, mmapped head
 // chunks, chunk snapshots, series state file, and in-memory structures).
 // It must only be called during initialization before writes begin.
+//
+// The WAL, which holds the corrupted checkpoint that triggers the reset, is
+// cleared last. If any earlier step fails, the corrupted checkpoint stays on
+// disk, so the next Open hits the same corruption and runs the whole reset
+// again instead of loading stale snapshots, head chunks or WBL data against a
+// fresh WAL.
 func (h *Head) reset() error {
-	if h.wal != nil {
-		if err := h.wal.Reset(); err != nil {
-			return fmt.Errorf("reset WAL: %w", err)
-		}
-		if err := os.Remove(filepath.Join(h.wal.Dir(), seriesStateFilename)); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove series state file: %w", err)
-		}
-	}
-	if h.wbl != nil {
-		if err := h.wbl.Reset(); err != nil {
-			return fmt.Errorf("reset WBL: %w", err)
+	if h.opts.ChunkDirRoot != "" {
+		if err := DeleteChunkSnapshots(h.opts.ChunkDirRoot, math.MaxInt, math.MaxInt); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("delete chunk snapshots: %w", err)
 		}
 	}
 	if h.chunkDiskMapper != nil {
@@ -1160,9 +1158,17 @@ func (h *Head) reset() error {
 			return fmt.Errorf("reset head chunks: %w", err)
 		}
 	}
-	if h.opts.ChunkDirRoot != "" {
-		if err := DeleteChunkSnapshots(h.opts.ChunkDirRoot, math.MaxInt, math.MaxInt); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("delete chunk snapshots: %w", err)
+	if h.wbl != nil {
+		if err := h.wbl.Reset(); err != nil {
+			return fmt.Errorf("reset WBL: %w", err)
+		}
+	}
+	if h.wal != nil {
+		if err := os.Remove(filepath.Join(h.wal.Dir(), seriesStateFilename)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove series state file: %w", err)
+		}
+		if err := h.wal.Reset(); err != nil {
+			return fmt.Errorf("reset WAL: %w", err)
 		}
 	}
 	if err := h.resetInMemoryState(); err != nil {
